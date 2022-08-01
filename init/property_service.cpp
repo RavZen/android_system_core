@@ -770,13 +770,13 @@ static void LoadPropertiesFromSecondStageRes(std::map<std::string, std::string>*
 // So we need to apply the same rule of build/make/tools/post_process_props.py
 // on runtime.
 static void update_sys_usb_config() {
-    bool is_secure = android::base::GetBoolProperty("ro.adb.secure", true);
+    bool is_debuggable = android::base::GetBoolProperty("ro.debuggable", false);
     std::string config = android::base::GetProperty("persist.sys.usb.config", "");
     // b/150130503, add (config == "none") condition here to prevent appending
     // ",adb" if "none" is explicitly defined in default prop.
     if (config.empty() || config == "none") {
-        InitPropertySet("persist.sys.usb.config", !is_secure ? "adb" : "none");
-    } else if (!is_secure && config.find("adb") == std::string::npos &&
+        InitPropertySet("persist.sys.usb.config", is_debuggable ? "adb" : "none");
+    } else if (is_debuggable && config.find("adb") == std::string::npos &&
                config.length() + 4 < PROP_VALUE_MAX) {
         config.append(",adb");
         InitPropertySet("persist.sys.usb.config", config);
@@ -797,8 +797,14 @@ static void load_override_properties() {
     }
 }
 
+constexpr auto ANDROIDBOOT_MODE = "androidboot.mode"sv;
+
 static const char *snet_prop_key[] = {
+    "ro.boot.vbmeta.device_state",
+    "ro.boot.verifiedbootstate",
+    "ro.boot.flash.locked",
     "ro.boot.selinux",
+    "ro.boot.veritymode",
     "ro.boot.warranty_bit",
     "ro.warranty_bit",
     "ro.debuggable",
@@ -814,11 +820,17 @@ static const char *snet_prop_key[] = {
     "ro.system.build.tags",
     "ro.vendor.boot.warranty_bit",
     "ro.vendor.warranty_bit",
+    "vendor.boot.vbmeta.device_state",
+    "vendor.boot.verifiedbootstate",
     NULL
 };
 
 static const char *snet_prop_value[] = {
+    "locked", // ro.boot.vbmeta.device_state
+    "green", // ro.boot.verifiedbootstate
+    "1", // ro.boot.flash.locked
     "enforcing", // ro.boot.selinux
+    "enforcing", // ro.boot.veritymode
     "0", // ro.boot.warranty_bit
     "0", // ro.warranty_bit
     "0", // ro.debuggable
@@ -834,23 +846,49 @@ static const char *snet_prop_value[] = {
     "release-keys", // ro.system.build.tags
     "0", // ro.vendor.boot.warranty_bit
     "0", // ro.vendor.warranty_bit
+    "locked", // vendor.boot.vbmeta.device_state
+    "green", // vendor.boot.verifiedbootstate
     NULL
 };
 
 static void workaround_snet_properties() {
     std::string build_type = android::base::GetProperty("ro.build.type", "");
 
+    // Check whether this is a normal boot, and whether the bootloader is actually locked
+    auto isNormalBoot = true; // no prop = normal boot
+    // This runs before keys are set as props, so we need to process them ourselves.
+    ImportKernelCmdline([&](const std::string& key, const std::string& value) {
+        if (key == ANDROIDBOOT_MODE && value != "normal") {
+            isNormalBoot = false;
+        }
+    });
+    ImportBootconfig([&](const std::string& key, const std::string& value) {
+        if (key == ANDROIDBOOT_MODE && value != "normal") {
+            isNormalBoot = false;
+        }
+    });
+
+    // Bail out if this is recovery, fastbootd, or anything other than a normal boot.
+    // fastbootd, in particular, needs the real values so it can allow flashing on
+    // unlocked bootloaders.
+    if (!isNormalBoot || IsRecoveryMode()) {
+        return;
+    }
+
+    // Exit if eng build
+    if (build_type == "eng") {
+        return;
+    }
+
     // Weaken property override security to set safetynet props
     weaken_prop_override_security = true;
 
     std::string error;
 
-    // Hide all sensitive props if not eng build
-    if (build_type != "eng") {
-        LOG(INFO) << "snet: Hiding sensitive props";
-        for (int i = 0; snet_prop_key[i]; ++i) {
-            PropertySet(snet_prop_key[i], snet_prop_value[i], &error);
-        }
+    // Hide all sensitive props 
+    LOG(INFO) << "snet: Hiding sensitive props";
+    for (int i = 0; snet_prop_key[i]; ++i) {
+        PropertySet(snet_prop_key[i], snet_prop_value[i], &error);
     }
 
     // Extra pops
@@ -1175,6 +1213,9 @@ void PropertyLoadBootDefaults() {
     property_derive_legacy_build_fingerprint();
     property_initialize_ro_cpu_abilist();
 
+    // Restore the normal property override security after init extension is executed
+    weaken_prop_override_security = false;
+
     update_sys_usb_config();
 
     // Workaround SafetyNet
@@ -1324,23 +1365,6 @@ static void ProcessBootconfig() {
     });
 }
 
-static void SetSafetyNetProps() {
-    // Bail out if this is recovery, fastbootd, or anything other than a normal boot.
-    // fastbootd, in particular, needs the real values so it can allow flashing on
-    // unlocked bootloaders.
-    if (IsRecoveryMode()) {
-        return;
-    }
-
-    // Spoof properties
-    InitPropertySet("ro.boot.flash.locked", "1");
-    InitPropertySet("ro.boot.verifiedbootstate", "green");
-    InitPropertySet("ro.boot.veritymode", "enforcing");
-    InitPropertySet("ro.boot.vbmeta.device_state", "locked");
-    InitPropertySet("vendor.boot.vbmeta.device_state", "locked");
-    InitPropertySet("vendor.boot.verifiedbootstate", "green");
-}
-
 void PropertyInit() {
     selinux_callback cb;
     cb.func_audit = PropertyAuditCallback;
@@ -1354,9 +1378,6 @@ void PropertyInit() {
     if (!property_info_area.LoadDefaultPath()) {
         LOG(FATAL) << "Failed to load serialized property info file";
     }
-
-    // Report valid verified boot chain to help pass Google SafetyNet integrity checks
-    SetSafetyNetProps();
 
     // If arguments are passed both on the command line and in DT,
     // properties set in DT always have priority over the command-line ones.
